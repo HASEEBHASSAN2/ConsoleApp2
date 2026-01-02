@@ -28,38 +28,61 @@ namespace ConsoleApp2
             {
                 if (_isInitialized) return;
 
+                var initEvent = new ManualResetEvent(false);
+
                 _staThread = new Thread(() =>
                 {
-                    _messageLoopForm = new Form();
-                    _messageLoopForm.ShowInTaskbar = false;
-                    _messageLoopForm.WindowState = FormWindowState.Minimized;
-                    _messageLoopForm.Opacity = 0;
-                    _messageLoopForm.CreateControl();
+                    try
+                    {
+                        // Set SynchronizationContext FIRST before any TWAIN calls
+                        SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+                        _syncContext = SynchronizationContext.Current;
 
-                    _syncContext = SynchronizationContext.Current;
+                        _messageLoopForm = new Form();
+                        _messageLoopForm.ShowInTaskbar = false;
+                        _messageLoopForm.WindowState = FormWindowState.Minimized;
+                        _messageLoopForm.Opacity = 0;
+                        
+                        // Create control handle
+                        var handle = _messageLoopForm.Handle; // Force handle creation
+                        
+                        // Now initialize TWAIN
+                        var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, System.Reflection.Assembly.GetExecutingAssembly());
+                        _session = new TwainSession(appId);
+                        
+                        var openResult = _session.Open();
+                        if (openResult != ReturnCode.Success)
+                        {
+                            throw new Exception($"Failed to open TWAIN session: {openResult}");
+                        }
 
-                    var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, System.Reflection.Assembly.GetExecutingAssembly());
-                    _session = new TwainSession(appId);
-                    _session.Open();
+                        _isInitialized = true;
+                        initEvent.Set();
 
-                    _isInitialized = true;
-
-                    Application.Run(_messageLoopForm);
+                        // Run message loop
+                        Application.Run(_messageLoopForm);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"? TWAIN initialization error: {ex.Message}");
+                        initEvent.Set();
+                    }
                 });
 
                 _staThread.SetApartmentState(ApartmentState.STA);
                 _staThread.IsBackground = true;
+                _staThread.Name = "TWAIN_STA_Thread";
                 _staThread.Start();
 
-                var timeout = DateTime.Now.AddSeconds(5);
-                while (!_isInitialized && DateTime.Now < timeout)
+                // Wait for initialization with proper event
+                if (!initEvent.WaitOne(TimeSpan.FromSeconds(10)))
                 {
-                    Thread.Sleep(100);
+                    throw new Exception("TWAIN initialization timeout");
                 }
 
                 if (!_isInitialized)
                 {
-                    throw new Exception("Failed to initialize scanner service");
+                    throw new Exception("Failed to initialize TWAIN scanner service");
                 }
             }
         }
@@ -117,6 +140,27 @@ namespace ConsoleApp2
                     tcs.SetException(ex);
                 }
             }, null);
+
+            return tcs.Task;
+        }
+
+        public static Task<ScanResult> ScanSimpleAsync(string scannerId, string outputPath)
+        {
+            var tcs = new TaskCompletionSource<ScanResult>();
+
+            // Run in background with TWAIN to trigger, then monitor files
+            Task.Run(() =>
+            {
+                try
+                {
+                    var result = PerformSimpleScanWithAutoTrigger(scannerId, outputPath);
+                    tcs.SetResult(result);
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetException(ex);
+                }
+            });
 
             return tcs.Task;
         }
@@ -233,6 +277,7 @@ namespace ConsoleApp2
                 if (src == null)
                     throw new Exception($"Scanner '{scannerId}' not found");
 
+                // Subscribe to session events (these fire on the STA thread)
                 _session.DataTransferred += dataTransferredHandler;
                 _session.TransferError += transferErrorHandler;
                 _session.SourceDisabled += sourceDisabledHandler;
@@ -243,44 +288,51 @@ namespace ConsoleApp2
                     throw new Exception($"Failed to open scanner: {openResult}");
                 
                 sourceOpened = true;
-                Console.WriteLine("? Scanner opened");
 
-                Console.WriteLine("? Enabling scanner (ShowUI mode - will show scanner dialog)...");
-                // Use ShowUI mode - this is more reliable and avoids threading issues
-                var enableResult = src.Enable(SourceEnableMode.ShowUI, true, _messageLoopForm.Handle);
+                Console.WriteLine("? Enabling scanner (NoUI, auto-scan)...");
+                // NoUI mode with modal=false allows automatic scanning
+                var enableResult = src.Enable(SourceEnableMode.NoUI, false, _messageLoopForm.Handle);
                 if (enableResult != ReturnCode.Success)
                     throw new Exception($"Failed to enable scanner: {enableResult}");
                 
-                Console.WriteLine("? Scanner dialog shown, waiting for user to scan...");
-
-                // Wait longer since user needs to interact with dialog
-                var startTime = DateTime.Now;
-                var lastLogTime = DateTime.Now;
+                Console.WriteLine("? Scanner enabled");
                 
-                while (!scanComplete && (DateTime.Now - startTime).TotalSeconds < 60)
+                // Give scanner a moment to detect document and initialize
+                Console.WriteLine("? Checking for document...");
+                for (int i = 0; i < 20; i++) // 2 seconds to detect
                 {
                     Application.DoEvents();
-                    Thread.Sleep(50);
+                    Thread.Sleep(100);
+                }
+                
+                Console.WriteLine("? Ready, waiting for scan...");
+
+                // Wait and pump messages on THIS thread (the STA thread where events will fire)
+                var startTime = DateTime.Now;
+                var lastLog = DateTime.Now;
+                
+                while (!scanComplete && (DateTime.Now - startTime).TotalSeconds < 20)
+                {
+                    // CRITICAL: Process messages on the STA thread
+                    Application.DoEvents();
+                    Thread.Sleep(100);
                     
-                    if ((DateTime.Now - lastLogTime).TotalSeconds >= 5 && !dataReceived)
+                    if ((DateTime.Now - lastLog).TotalSeconds >= 3 && !dataReceived)
                     {
-                        Console.WriteLine($"? Waiting for scan... ({(int)(DateTime.Now - startTime).TotalSeconds}s)");
-                        lastLogTime = DateTime.Now;
+                        Console.WriteLine($"? Waiting ({(int)(DateTime.Now - startTime).TotalSeconds}s)...");
+                        lastLog = DateTime.Now;
                     }
                     
                     if (dataReceived && !scanComplete)
                     {
-                        var waitStart = DateTime.Now;
-                        while ((DateTime.Now - waitStart).TotalMilliseconds < 2000 && !scanComplete)
+                        var wait = DateTime.Now;
+                        while ((DateTime.Now - wait).TotalMilliseconds < 1500 && !scanComplete)
                         {
                             Application.DoEvents();
                             Thread.Sleep(50);
                         }
                         if (!scanComplete)
-                        {
-                            Console.WriteLine("? Completing");
                             scanComplete = true;
-                        }
                     }
                 }
 
@@ -288,10 +340,7 @@ namespace ConsoleApp2
                     throw scanException;
 
                 if (!dataReceived)
-                {
-                    Console.WriteLine("? Timeout or cancelled");
-                    throw new TimeoutException("Scan was cancelled or timed out.");
-                }
+                    throw new TimeoutException("No document detected. Place document in feeder and ensure it's detected by scanner.");
 
                 Console.WriteLine("? Scan complete\n");
                 return result;
@@ -311,11 +360,254 @@ namespace ConsoleApp2
 
                 if (src != null && sourceOpened)
                 {
-                    try { src.Close(); } catch { }
+                    try 
+                    { 
+                        Console.WriteLine("? Closing scanner...");
+                        src.Close();
+                        Console.WriteLine("? Scanner closed");
+                        
+                        // CRITICAL: Give scanner time to fully reset
+                        Thread.Sleep(1000);
+                        
+                        // Extra message pumping to ensure cleanup
+                        for (int i = 0; i < 10; i++)
+                        {
+                            Application.DoEvents();
+                            Thread.Sleep(50);
+                        }
+                    } 
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"? Close error: {ex.Message}");
+                    }
                 }
                 
-                Thread.Sleep(500);
-                Application.DoEvents();
+                Console.WriteLine("? Ready for next scan\n");
+            }
+        }
+
+        private static ScanResult PerformSimpleScanWithAutoTrigger(string scannerId, string outputPath)
+        {
+            var result = new ScanResult();
+
+            try
+            {
+                Directory.CreateDirectory(outputPath);
+
+                var scanLocations = new List<string>
+                {
+                    outputPath,
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Scanned Documents"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "My Scans"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "Epson"),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "Scanned Documents"),
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments), "Scanned Documents"),
+                    @"C:\Users\Public\Documents\Scanned Documents",
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop))
+                };
+
+                var baselineFiles = new Dictionary<string, HashSet<string>>();
+                
+                Console.WriteLine("?? Monitoring folders:");
+                foreach (var location in scanLocations.Where(Directory.Exists))
+                {
+                    var existingFiles = new HashSet<string>(
+                        Directory.GetFiles(location, "*.*", SearchOption.TopDirectoryOnly)
+                        .Where(f => {
+                            var ext = Path.GetExtension(f).ToLower();
+                            return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".pdf";
+                        })
+                    );
+                    baselineFiles[location] = existingFiles;
+                }
+
+                // TRIGGER SCAN AUTOMATICALLY using Epson Scan utility
+                Console.WriteLine($"\n? AUTO-TRIGGERING scan on {scannerId}...");
+                
+                // Try to launch Epson Scan with auto-scan parameter
+                try
+                {
+                    var epsonPaths = new[]
+                    {
+                        @"C:\Program Files (x86)\epson\Epson Scan 2\Core\es2launcher.exe",
+                        @"C:\Program Files\epson\Epson Scan 2\Core\es2launcher.exe",
+                        @"C:\Windows\twain_32\escndv\escndv.exe",
+                        @"C:\Windows\twain_32\epson\escndv\escndv.exe"
+                    };
+
+                    string epsonExe = epsonPaths.FirstOrDefault(File.Exists);
+                    
+                    if (epsonExe != null)
+                    {
+                        Console.WriteLine($"? Found Epson Scan: {epsonExe}");
+                        
+                        // Start Epson Scan with parameters for auto-scan
+                        var startInfo = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = epsonExe,
+                            Arguments = "/AUTO",  // Auto-scan parameter
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+                        };
+                        
+                        System.Diagnostics.Process.Start(startInfo);
+                        Console.WriteLine("? Scan triggered via Epson utility");
+                    }
+                    else
+                    {
+                        Console.WriteLine("? Epson Scan utility not found, waiting for manual scan...");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"? Could not auto-trigger: {ex.Message}");
+                    Console.WriteLine("  Waiting for manual scan button press...");
+                }
+
+                Console.WriteLine("?? Monitoring for scanned file...\n");
+
+                // Monitor folders for new files
+                var startTime = DateTime.Now;
+                var timeout = TimeSpan.FromSeconds(30); // Reduced timeout since auto-triggered
+                string newFile = null;
+                string foundLocation = null;
+
+                while ((DateTime.Now - startTime) < timeout)
+                {
+                    Thread.Sleep(500);
+
+                    foreach (var kvp in baselineFiles)
+                    {
+                        var location = kvp.Key;
+                        var baseline = kvp.Value;
+
+                        if (!Directory.Exists(location)) continue;
+
+                        var currentFiles = Directory.GetFiles(location, "*.*", SearchOption.TopDirectoryOnly)
+                            .Where(f => {
+                                var ext = Path.GetExtension(f).ToLower();
+                                return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".pdf";
+                            })
+                            .Where(f => !baseline.Contains(f))
+                            .OrderByDescending(f => File.GetCreationTime(f))
+                            .ToList();
+
+                        if (currentFiles.Any())
+                        {
+                            newFile = currentFiles.First();
+                            foundLocation = location;
+                            Console.WriteLine($"? New file detected: {Path.GetFileName(newFile)}");
+                            Console.WriteLine($"? Location: {location}");
+                            break;
+                        }
+                    }
+
+                    if (newFile != null) break;
+
+                    var elapsed = (int)(DateTime.Now - startTime).TotalSeconds;
+                    if (elapsed > 0 && elapsed % 5 == 0)
+                    {
+                        Console.WriteLine($"? Waiting... ({elapsed}s / 30s)");
+                    }
+                }
+
+                if (newFile == null)
+                {
+                    throw new TimeoutException("No scan detected. Ensure document is loaded in scanner feeder.");
+                }
+
+                // Wait for file to be fully written
+                Console.WriteLine($"? Waiting for file to be fully written...");
+                Thread.Sleep(3000); // Increased from 2000 to 3000ms
+
+                // Retry mechanism - check multiple times for valid files
+                string validFile = null;
+                var maxRetries = 10; // Try 10 times
+                var retryDelay = 500; // 500ms between retries
+
+                for (int retry = 0; retry < maxRetries; retry++)
+                {
+                    // Get ALL new files in the location
+                    var allNewFiles = Directory.GetFiles(foundLocation, "*.*", SearchOption.TopDirectoryOnly)
+                        .Where(f => {
+                            var ext = Path.GetExtension(f).ToLower();
+                            return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".pdf";
+                        })
+                        .Where(f => !baselineFiles[foundLocation].Contains(f)) // Files NOT in baseline
+                        .Select(f => new FileInfo(f))
+                        .Where(fi => fi.Length > 0) // Has content
+                        .OrderByDescending(fi => fi.CreationTime)
+                        .ToList();
+
+                    if (allNewFiles.Any())
+                    {
+                        validFile = allNewFiles.First().FullName;
+                        Console.WriteLine($"? Found valid file: {Path.GetFileName(validFile)} ({allNewFiles.First().Length} bytes) on retry {retry + 1}");
+                        break;
+                    }
+
+                    if (retry < maxRetries - 1)
+                    {
+                        Console.WriteLine($"? Retry {retry + 1}/{maxRetries} - waiting for scanner to finish writing...");
+                        Thread.Sleep(retryDelay);
+                    }
+                }
+
+                if (validFile == null)
+                {
+                    Console.WriteLine("? No valid scanned file found after all retries!");
+                    Console.WriteLine("   This might be a timing issue with the scanner.");
+                    throw new Exception("No valid scanned file found. Scanner may still be writing files.");
+                }
+
+                newFile = validFile;
+                var fileInfo = new FileInfo(newFile);
+                Console.WriteLine($"? File ready: {Path.GetFileName(newFile)} ({fileInfo.Length} bytes)");
+
+                // Use the original file directly instead of moving/copying
+                result.Success = true;
+                result.ImagePath = newFile;
+                result.FileName = Path.GetFileName(newFile);
+
+                Console.WriteLine($"? SUCCESS: {result.FileName}");
+                Console.WriteLine($"? Location: {newFile}");
+
+                // PERFORM OCR
+                Console.WriteLine("\n?? Performing OCR on scanned image...");
+                try
+                {
+                    result.OCRData = OCRService.PerformMultiLanguageOCR(newFile); // Use the original file
+                    
+                    if (result.OCRData.Success)
+                    {
+                        Console.WriteLine($"? OCR completed successfully");
+                        Console.WriteLine($"   Extracted {result.OCRData.ExtractedText?.Length ?? 0} characters");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"? OCR failed: {result.OCRData.ErrorMessage}");
+                    }
+                }
+                catch (Exception ocrEx)
+                {
+                    Console.WriteLine($"? OCR error: {ocrEx.Message}");
+                    result.OCRData = new OCRResult
+                    {
+                        Success = false,
+                        ErrorMessage = ocrEx.Message
+                    };
+                }
+
+                Console.WriteLine();
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"? Error: {ex.Message}");
+                throw;
             }
         }
 
@@ -344,5 +636,6 @@ namespace ConsoleApp2
         public string ImagePath { get; set; }
         public string FileName { get; set; }
         public string ErrorMessage { get; set; }
+        public OCRResult OCRData { get; set; }
     }
 }

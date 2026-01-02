@@ -34,7 +34,8 @@ namespace ConsoleApp2
                 Console.WriteLine($"Scan images will be saved to: {_outputPath}");
                 Console.WriteLine("\nAvailable endpoints:");
                 Console.WriteLine($"  GET  {_baseUrl}api/scanners - List available scanners");
-                Console.WriteLine($"  POST {_baseUrl}api/scan - Start scanning");
+                Console.WriteLine($"  POST {_baseUrl}api/scan - Start scanning (TWAIN events)");
+                Console.WriteLine($"  POST {_baseUrl}api/scan/simple - Start scanning (file monitoring) ? NEW");
                 Console.WriteLine($"  GET  {_baseUrl}api/images/{{filename}} - Get scanned image");
                 Console.WriteLine("\nPress Ctrl+C to stop the server...");
                 Console.WriteLine("Waiting for requests...\n");
@@ -130,6 +131,10 @@ namespace ConsoleApp2
                 else if (path == "/api/scan" && context.Request.HttpMethod == "POST")
                 {
                     await HandleScanAsync(context);
+                }
+                else if (path == "/api/scan/simple" && context.Request.HttpMethod == "POST")
+                {
+                    await HandleSimpleScanAsync(context);
                 }
                 else if (path.StartsWith("/api/images/") && context.Request.HttpMethod == "GET")
                 {
@@ -241,6 +246,78 @@ namespace ConsoleApp2
             catch (Exception ex)
             {
                 Console.WriteLine($"Scan error: {ex.Message}");
+                context.Response.StatusCode = 500;
+                await SendJsonResponse(context, new
+                {
+                    success = false,
+                    error = ex.Message
+                });
+            }
+        }
+
+        private async Task HandleSimpleScanAsync(HttpListenerContext context)
+        {
+            Console.WriteLine("POST /api/scan/simple - Starting SIMPLE scan (file monitoring)");
+
+            try
+            {
+                string requestBody;
+                using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding))
+                {
+                    requestBody = await reader.ReadToEndAsync();
+                }
+
+                var scanRequest = JsonConvert.DeserializeObject<ScanRequest>(requestBody);
+
+                if (string.IsNullOrEmpty(scanRequest?.ScannerId))
+                {
+                    context.Response.StatusCode = 400;
+                    await SendJsonResponse(context, new
+                    {
+                        success = false,
+                        error = "ScannerId is required"
+                    });
+                    return;
+                }
+
+                Console.WriteLine($"Simple scanning with: {scanRequest.ScannerId}");
+
+                var result = await ScannerService.ScanSimpleAsync(scanRequest.ScannerId, _outputPath);
+
+                if (result.Success)
+                {
+                    Console.WriteLine($"Simple scan successful: {result.FileName}");
+                    
+                    await SendJsonResponse(context, new
+                    {
+                        success = true,
+                        imagePath = result.ImagePath,
+                        fileName = result.FileName,
+                        imageUrl = $"{_baseUrl}api/images/{result.FileName}",
+                        method = "simple_file_monitoring",
+                        ocr = result.OCRData != null ? new
+                        {
+                            success = result.OCRData.Success,
+                            text = result.OCRData.ExtractedText,
+                            confidence = result.OCRData.Confidence,
+                            error = result.OCRData.ErrorMessage
+                        } : null
+                    });
+                }
+                else
+                {
+                    Console.WriteLine($"Simple scan failed: {result.ErrorMessage}");
+                    context.Response.StatusCode = 500;
+                    await SendJsonResponse(context, new
+                    {
+                        success = false,
+                        error = result.ErrorMessage
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Simple scan error: {ex.Message}");
                 context.Response.StatusCode = 500;
                 await SendJsonResponse(context, new
                 {
